@@ -1,16 +1,17 @@
 """
 tools.py
 
-The three required FitFindr tools. Each tool is a standalone function that
-can be called and tested independently before being wired into the agent loop.
+The FitFindr tools — three required + two stretch features.
 
 Tools:
     search_listings(description, size, max_price)  → list[dict]
     suggest_outfit(new_item, wardrobe)              → str
     create_fit_card(outfit, new_item)               → str
+    compare_price(item)                             → str  [stretch]
 """
 
 import os
+import statistics
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -53,17 +54,21 @@ def search_listings(
     Returns:
         A list of matching listing dicts sorted by relevance (best match first).
         Returns an empty list if nothing matches — does NOT raise an exception.
+
+    Each listing dict has fields:
+        id, title, description, category, style_tags (list), size,
+        condition, price (float), colors (list), brand, platform
     """
     try:
         listings = load_listings()
     except Exception:
         return []
 
-    # Step 1: Filter by max_price
+    # Filter by max_price
     if max_price is not None:
         listings = [item for item in listings if item["price"] <= max_price]
 
-    # Step 2: Filter by size (case-insensitive substring match)
+    # Filter by size (case-insensitive substring match)
     if size is not None:
         size_lower = size.lower().strip()
         listings = [
@@ -71,39 +76,24 @@ def search_listings(
             if size_lower in item["size"].lower()
         ]
 
-    # Step 3: Score each listing by keyword overlap with description
+    # Score each listing by keyword overlap with description
     keywords = set(description.lower().split())
 
     def score_listing(item: dict) -> int:
         score = 0
-        # Check title
         title_words = set(item["title"].lower().split())
-        score += len(keywords & title_words) * \
-            3  # title matches weighted higher
-
-        # Check description
+        score += len(keywords & title_words) * 3        # title: high weight
         desc_words = set(item["description"].lower().split())
-        score += len(keywords & desc_words)
-
-        # Check style_tags
-        tags_text = " ".join(item["style_tags"]).lower()
-        tags_words = set(tags_text.split())
-        score += len(keywords & tags_words) * 2  # tags weighted medium
-
-        # Check category
+        score += len(keywords & desc_words)             # description: low weight
+        tags_words = set(" ".join(item["style_tags"]).lower().split())
+        score += len(keywords & tags_words) * 2         # style_tags: medium weight
         if item["category"].lower() in keywords:
             score += 2
-
         return score
 
     scored = [(item, score_listing(item)) for item in listings]
-
-    # Step 4: Drop zero-score listings
     scored = [(item, s) for item, s in scored if s > 0]
-
-    # Step 5: Sort by score descending
     scored.sort(key=lambda x: x[1], reverse=True)
-
     return [item for item, _ in scored]
 
 
@@ -115,10 +105,11 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Args:
         new_item: A listing dict (the item the user is considering buying).
-        wardrobe: A wardrobe dict with an 'items' key. May be empty.
+        wardrobe: A wardrobe dict with an 'items' key. May be empty — handled gracefully.
 
     Returns:
         A non-empty string with outfit suggestions or general styling advice.
+        Never raises an exception.
     """
     try:
         client = _get_groq_client()
@@ -136,19 +127,18 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     wardrobe_items = wardrobe.get("items", [])
 
-    # Step 1: Check if wardrobe is empty
     if not wardrobe_items:
+        # Empty wardrobe: give general styling advice
         prompt = (
             f"A user is considering buying this secondhand item:\n\n"
             f"{item_summary}\n\n"
             f"They don't have a wardrobe entered yet. Give them 2 general outfit ideas "
             f"for this piece — describe what kinds of bottoms, shoes, and layers would "
-            f"pair well with it, what aesthetic or vibe it suits, and one specific styling "
-            f"tip (like tucking, layering, or accessorizing). Keep it conversational and "
+            f"pair well with it, what aesthetic it suits, and one specific styling tip "
+            f"(like tucking, layering, or accessorizing). Keep it conversational and "
             f"specific — not generic fashion advice."
         )
     else:
-        # Format wardrobe for the prompt
         wardrobe_lines = []
         for w_item in wardrobe_items:
             tags = ", ".join(w_item.get("style_tags", []))
@@ -158,7 +148,6 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             if notes:
                 line += f" | notes: {notes}"
             wardrobe_lines.append(line)
-
         wardrobe_text = "\n".join(wardrobe_lines)
 
         prompt = (
@@ -201,9 +190,10 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Returns:
         A 2–4 sentence string usable as an Instagram/TikTok caption.
-        Returns a descriptive error string if outfit is empty — does NOT raise.
+        If outfit is empty or missing, returns a descriptive error message
+        string — does NOT raise an exception.
     """
-    # Step 1: Guard against empty outfit
+    # Guard against empty outfit
     if not outfit or not outfit.strip():
         return (
             "Can't generate a fit card without an outfit suggestion — "
@@ -240,13 +230,93 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150,
-            temperature=1.2,  # Higher temperature for variety
+            temperature=1.2,  # Higher for caption variety
         )
         result = response.choices[0].message.content.strip()
         if not result:
             raise ValueError("Empty LLM response")
         return result
     except Exception:
+        return "Fit card unavailable right now, but trust — this look is giving."
+
+
+# ── Stretch Tool: compare_price ───────────────────────────────────────────────
+
+def compare_price(item: dict) -> str:
+    """
+    Compare an item's price to similar listings in the dataset and assess
+    whether it's a good deal, average, or overpriced.
+
+    Args:
+        item: A listing dict with at least 'price' (float) and 'category' (str).
+
+    Returns:
+        A string summarizing the price comparison with reasoning.
+        Returns a fallback string if not enough comparable listings exist.
+    """
+    try:
+        all_listings = load_listings()
+    except Exception:
+        return "Unable to load listings for price comparison."
+
+    item_price = item.get("price")
+    item_category = item.get("category", "").lower()
+    item_condition = item.get("condition", "").lower()
+
+    if item_price is None:
+        return "This item has no price listed — can't compare."
+
+    # Find comparable listings: same category, exclude the item itself
+    comparables = [
+        l for l in all_listings
+        if l["category"].lower() == item_category and l["id"] != item.get("id")
+    ]
+
+    if len(comparables) < 3:
         return (
-            "Fit card unavailable right now, but trust — this look is giving."
+            f"Not enough comparable listings in '{item_category}' to assess price "
+            f"for this item. Listed at ${item_price:.2f}."
         )
+
+    prices = [l["price"] for l in comparables]
+    avg_price = statistics.mean(prices)
+    median_price = statistics.median(prices)
+    min_price = min(prices)
+    max_price = max(prices)
+
+    # Condition modifier — same condition comparables
+    same_condition = [l for l in comparables if l["condition"].lower() == item_condition]
+    condition_note = ""
+    if len(same_condition) >= 2:
+        cond_avg = statistics.mean([l["price"] for l in same_condition])
+        condition_note = (
+            f" Among '{item_condition}' condition {item_category}, "
+            f"the average is ${cond_avg:.2f}."
+        )
+
+    # Price assessment
+    pct_vs_avg = (item_price - avg_price) / avg_price * 100
+
+    if item_price <= avg_price * 0.75:
+        verdict = "🟢 Great deal"
+        explanation = f"priced {abs(pct_vs_avg):.0f}% below the category average"
+    elif item_price <= avg_price * 0.95:
+        verdict = "🟡 Below average — solid pick"
+        explanation = f"priced {abs(pct_vs_avg):.0f}% below the category average"
+    elif item_price <= avg_price * 1.10:
+        verdict = "🟡 Fair price"
+        explanation = "close to the category average"
+    elif item_price <= avg_price * 1.30:
+        verdict = "🟠 Slightly above average"
+        explanation = f"priced {pct_vs_avg:.0f}% above the category average"
+    else:
+        verdict = "🔴 Pricey for this category"
+        explanation = f"priced {pct_vs_avg:.0f}% above the category average"
+
+    return (
+        f"{verdict} — {explanation}.\n"
+        f"Category: {item_category.capitalize()} | "
+        f"Price range in dataset: ${min_price:.2f}–${max_price:.2f} | "
+        f"Category average: ${avg_price:.2f} | Median: ${median_price:.2f}\n"
+        f"This item: ${item_price:.2f}.{condition_note}"
+    )

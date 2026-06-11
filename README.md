@@ -1,6 +1,6 @@
 # FitFindr 🛍️
 
-A multi-tool AI agent that helps users find secondhand clothing pieces and figure out how to wear them. FitFindr searches mock thrift listings, suggests outfit combinations based on your existing wardrobe, and generates a shareable fit card caption — all from a single natural language query.
+A multi-tool AI agent that helps users find secondhand clothing pieces and figure out how to wear them. FitFindr searches mock thrift listings, suggests outfit combinations based on your existing wardrobe, generates a shareable fit card caption, compares item prices to comparable listings, and remembers your style preferences across sessions — all from a single natural language query.
 
 Built for CodePath AI201, Project 2.
 
@@ -37,6 +37,16 @@ python app.py
 
 Open [http://localhost:7860](http://localhost:7860) in your browser.
 
+To run the CLI test (all 3 paths):
+```bash
+python agent.py
+```
+
+To run all tests:
+```bash
+pytest tests/ -v
+```
+
 ---
 
 ## Tool Inventory
@@ -47,19 +57,19 @@ Open [http://localhost:7860](http://localhost:7860) in your browser.
 |---|---|
 | **File** | `tools.py` |
 | **Inputs** | `description` (str), `size` (str \| None), `max_price` (float \| None) |
-| **Output** | `list[dict]` — matching listing dicts sorted by relevance score |
-| **Purpose** | Searches the 40-item mock listings dataset by keyword overlap across title, description, and style_tags. Filters by price ceiling and size before scoring. |
+| **Output** | `list[dict]` — matching listing dicts sorted by relevance score, highest first |
+| **Purpose** | Searches 40 mock secondhand listings by keyword overlap across title, description, and style_tags. Filters by price ceiling (inclusive) and size (case-insensitive substring match) before scoring. Title matches weighted 3×, style_tag matches 2×, description matches 1×. |
 
-Each listing dict returned contains: `id` (str), `title` (str), `description` (str), `category` (str), `style_tags` (list[str]), `size` (str), `condition` (str), `price` (float), `colors` (list[str]), `brand` (str|None), `platform` (str).
+Each dict in the returned list contains: `id` (str), `title` (str), `description` (str), `category` (str), `style_tags` (list[str]), `size` (str), `condition` (str), `price` (float), `colors` (list[str]), `brand` (str|None), `platform` (str).
 
 ### Tool 2: `suggest_outfit`
 
 | | |
 |---|---|
 | **File** | `tools.py` |
-| **Inputs** | `new_item` (dict), `wardrobe` (dict with `items` key) |
-| **Output** | `str` — 1–2 outfit suggestions referencing specific wardrobe pieces |
-| **Purpose** | Calls Groq LLM (llama-3.3-70b-versatile) to generate outfit combinations using the thrifted item and the user's existing wardrobe. Falls back to general styling advice if wardrobe is empty. |
+| **Inputs** | `new_item` (dict), `wardrobe` (dict with `items` key containing list of wardrobe item dicts) |
+| **Output** | `str` — 1–2 outfit suggestions referencing specific wardrobe pieces by name, or general styling advice if wardrobe is empty |
+| **Purpose** | Calls Groq LLM (llama-3.3-70b-versatile, temperature=0.8) with the item details and wardrobe contents to generate contextual outfit combinations. Falls back to general styling advice when wardrobe has no items. Never raises an exception. |
 
 ### Tool 3: `create_fit_card`
 
@@ -67,49 +77,71 @@ Each listing dict returned contains: `id` (str), `title` (str), `description` (s
 |---|---|
 | **File** | `tools.py` |
 | **Inputs** | `outfit` (str), `new_item` (dict) |
-| **Output** | `str` — a 2–4 sentence Instagram/TikTok caption |
-| **Purpose** | Calls Groq LLM at temperature=1.2 to generate a casual, authentic OOTD caption. Mentions item name, price, and platform naturally. Produces different output each run. |
+| **Output** | `str` — a 2–4 sentence Instagram/TikTok caption, or a descriptive error string if outfit is empty |
+| **Purpose** | Calls Groq LLM at temperature=1.2 to generate a casual, authentic OOTD caption. Naturally mentions item name, price, and platform once each. Higher temperature ensures different output each run. Returns a specific error string (not exception) if `outfit` is empty or whitespace-only. |
+
+### Stretch Tool: `compare_price`
+
+| | |
+|---|---|
+| **File** | `tools.py` |
+| **Inputs** | `item` (dict) — a listing dict with at least `price` (float) and `category` (str) |
+| **Output** | `str` — price verdict (🟢/🟡/🟠/🔴) with reasoning, category average, price range, and condition note |
+| **Purpose** | Compares the item's price against all other listings in the same category. Calculates mean, median, min, and max prices. Also compares against same-condition listings when 2+ exist. Returns a fallback string if fewer than 3 comparables exist. |
 
 ---
 
 ## How the Planning Loop Works
 
-The planning loop in `run_agent()` (`agent.py`) follows conditional logic — it does not call all tools unconditionally:
+The planning loop in `run_agent()` (`agent.py`) uses explicit conditional branching — it does not call all tools in a fixed sequence:
 
 ```
-1. Parse query → extract description, size, max_price (via LLM with regex fallback)
-2. Call search_listings(description, size, max_price)
-   → If results is EMPTY: set session["error"] and RETURN EARLY
-     (suggest_outfit and create_fit_card are NOT called)
-   → If results has items: set selected_item = results[0], continue
-3. Call suggest_outfit(selected_item, wardrobe)
-   → If outfit is empty: set session["error"] and RETURN EARLY
-   → Otherwise: store in session["outfit_suggestion"], continue
-4. Call create_fit_card(outfit_suggestion, selected_item)
-   → Store in session["fit_card"]
-5. Return completed session
+Step 1: Initialize session dict (_new_session)
+Step 2: Parse query → LLM extracts description, size, max_price
+        (regex fallback if LLM call fails)
+Step 3: Call _search_with_retry(description, size, max_price)
+        → Attempt 1: full constraints (description + size + max_price)
+        → If empty + size was set → Attempt 2: drop size filter, keep price
+        → If still empty + price was set → Attempt 3: drop both filters
+        → If still empty after all retries:
+              set session["error"] with actionable message
+              RETURN EARLY — suggest_outfit is NOT called
+        → If results found:
+              set session["selected_item"] = results[0]
+              set session["retry_note"] if constraints were loosened
+Step 4: Call suggest_outfit(selected_item, wardrobe)
+        → If empty response: set session["error"], RETURN EARLY
+        → Otherwise: store in session["outfit_suggestion"], continue
+Step 5: Call create_fit_card(outfit_suggestion, selected_item)
+        → Store in session["fit_card"]
+Step 6: Return completed session
 ```
 
-The key behavioral difference: if `search_listings` returns nothing, the agent stops immediately with an actionable error message and never attempts to suggest an outfit with empty input.
+**Key behavioral difference:** For a no-results query (e.g., "designer ballgown size XXS under $5"), the agent retries with loosened constraints, informs the user of what was adjusted, and if still nothing is found, returns early with a specific error. `suggest_outfit` is never called with a `None` item.
+
+**For a retry-triggered query** (e.g., "vintage tee size XS under $10"): the agent finds no results for size XS under $10, drops the size filter, finds results, and informs the user: *"No exact matches for size 'XS' — showing results for all sizes instead."* It then continues through suggest_outfit and create_fit_card normally.
 
 ---
 
 ## State Management
 
-All state lives in a single `session` dict initialized by `_new_session()` at the start of each `run_agent()` call. No state persists between sessions.
+All state is stored in a single `session` dict initialized by `_new_session()` at the start of each `run_agent()` call. No state persists between sessions in the core agent (style memory is handled separately by `style_memory.py`).
 
-| Key | Set when | Used by |
-|-----|----------|---------|
+| Key | Set when | Passed to |
+|-----|----------|-----------|
 | `query` | initialization | query parser |
-| `parsed` | after query parsing | search_listings call |
-| `search_results` | after search_listings | selected_item assignment |
-| `selected_item` | after non-empty results | suggest_outfit, create_fit_card |
+| `parsed` | after LLM/regex query parsing | search_listings args |
+| `search_results` | after _search_with_retry | selected_item assignment |
+| `selected_item` | after non-empty search_results | suggest_outfit, create_fit_card |
 | `wardrobe` | initialization | suggest_outfit |
 | `outfit_suggestion` | after suggest_outfit | create_fit_card |
 | `fit_card` | after create_fit_card | app.py Panel 3 |
-| `error` | any failure | app.py Panel 1 (error display) |
+| `error` | any failure or early exit | app.py Panel 1 |
+| `retry_note` | when constraints were loosened | app.py banner in Panel 1 |
 
-`app.py`'s `handle_query()` receives the completed session and maps keys directly to the three Gradio output panels.
+`app.py`'s `handle_query()` reads the completed session and maps keys directly to Gradio output panels — no re-entry by the user at any step.
+
+**State passing verified:** `session["selected_item"]` (set by search step) is passed directly into `suggest_outfit()`. `session["outfit_suggestion"]` (set by suggest step) is passed directly into `create_fit_card()`. Neither requires user re-entry.
 
 ---
 
@@ -117,54 +149,103 @@ All state lives in a single `session` dict initialized by `_new_session()` at th
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| `search_listings` | No listings match query | Sets `session["error"]`: "No listings found for '[description]'. Try broadening your search — remove the size filter, raise your price ceiling, or use different keywords." Returns session early — suggest_outfit is never called. |
-| `suggest_outfit` | Wardrobe is empty | Calls LLM with a general styling prompt instead of wardrobe-specific outfit combos. Returns advice like what bottoms, shoes, and layers pair well with the item. Never raises or returns empty string. |
-| `create_fit_card` | `outfit` param is empty or whitespace | Returns error string: "Can't generate a fit card without an outfit suggestion — run suggest_outfit first." Does not raise an exception. |
+| `search_listings` | No listings match query, even after retry | Sets `session["error"]`: "No listings found for '[description]' even after loosening filters. Try different keywords or remove size/price limits." Returns session early — suggest_outfit and create_fit_card are never called. |
+| `suggest_outfit` | Wardrobe is empty (`wardrobe["items"] == []`) | Calls LLM with a general styling prompt instead of wardrobe-specific combos. Returns advice like "pair with wide-leg jeans and chunky sneakers for a 90s vibe." Never raises or returns empty string. |
+| `create_fit_card` | `outfit` param is empty or whitespace-only | Returns specific error string: "Can't generate a fit card without an outfit suggestion — run suggest_outfit first." Does not raise an exception. |
 
-**Concrete example from testing:**
+**Concrete example from testing — no-results path:**
 
-Query: `"designer ballgown size XXS under $5"`
+```bash
+python -c "
+from tools import search_listings
+print(search_listings('designer ballgown', size='XXS', max_price=5))
+"
+# Output: []   ← empty list, no exception raised
 
+# Full agent with same query:
+python agent.py
+# Error: No listings found for "designer ballgown" size XXS under $5,
+#        even after loosening filters. Try different keywords...
 ```
-search_listings("designer ballgown", size="XXS", max_price=5.0)
-→ returns []
-→ session["error"] = "No listings found for 'designer ballgown' size XXS under $5.
-   Try broadening your search..."
-→ suggest_outfit: NOT called
-→ create_fit_card: NOT called
-→ app.py displays error in Panel 1, Panels 2 and 3 are empty
+
+**Concrete example — empty outfit string:**
+
+```bash
+python -c "
+from tools import search_listings, create_fit_card
+results = search_listings('vintage graphic tee', size=None, max_price=50)
+print(create_fit_card('', results[0]))
+"
+# Output: "Can't generate a fit card without an outfit suggestion —
+#          run suggest_outfit first."
 ```
+
+**Concrete example — retry logic triggered:**
+
+```bash
+python -c "
+from agent import _search_with_retry
+results, note = _search_with_retry('vintage tee', size='XS', max_price=10)
+print('Note:', note)
+print('Results:', len(results))
+"
+# Note: No exact matches for size 'XS' — showing results for all sizes instead.
+# Results: 3
+```
+
+---
+
+## Stretch Features
+
+### Price Comparison Tool (+2pts)
+
+`compare_price(item)` in `tools.py` takes a listing dict and compares its price against all other listings in the same category. It calculates mean, median, min, and max prices and returns a verdict:
+
+- 🟢 Great deal — priced 25%+ below category average
+- 🟡 Below average / Fair price — within ±10% of average  
+- 🟠 Slightly above average — 10–30% above average
+- 🔴 Pricey — 30%+ above average
+
+It also computes a same-condition average when 2+ comparables exist. Shown in the "💰 Price assessment" panel in the Gradio UI.
+
+### Style Profile Memory (+2pts)
+
+`style_memory.py` persists style preferences to `style_profile.json` between sessions. When "Remember my style preferences" is checked in the UI:
+
+- After each successful search, the agent extracts style tags, colors, size, and price from the selected item and saves them to the profile.
+- On the next session, if no size is mentioned in the query, the agent automatically appends the remembered size preference.
+- The "📋 Your style profile" panel displays current preferences including preferred styles, colors, size, and recent searches.
+- Profile can be cleared with the "🗑️ Clear style profile" button.
+
+**Two-session demo:** Search "vintage graphic tee" in session 1 with size M → profile saves size M and vintage/streetwear tags. In session 2, search "cardigan" without mentioning size → agent automatically appends "size M" to the query.
+
+### Retry Logic with Fallback (+1pt)
+
+`_search_with_retry()` in `agent.py` automatically loosens constraints when search returns empty:
+
+1. Try: description + size + max_price (original)
+2. If empty + size set → Try: description + max_price only (drop size)
+3. If still empty + price set → Try: description only (drop both)
+
+The user is informed of exactly what was adjusted via `session["retry_note"]`, displayed as a banner in the listing panel.
 
 ---
 
 ## Spec Reflection
 
-**One way the spec helped:** Filling out the planning loop section of `planning.md` with explicit conditional branches before writing code made it immediately clear that `run_agent()` needed two early-return points, not one. Without the spec, it would have been easy to accidentally call `suggest_outfit` with `None` as the item.
+**One way the spec helped:** The planning.md Architecture diagram made it immediately clear that `run_agent()` needed two distinct early-return points — one after search, one after suggest_outfit — rather than a single catch-all at the end. Without drawing the flow first, it would have been easy to call `suggest_outfit(None, wardrobe)` and get a hard crash.
 
-**One way implementation diverged from spec:** The query parser was originally planned as pure regex. During implementation, an LLM-based parser was added as the primary method (with regex as fallback) because natural language queries like "I mostly wear baggy jeans and chunky sneakers, looking for a vintage tee" don't parse well with simple patterns. The fallback still exists for cases where the LLM call fails.
+**One way implementation diverged from spec:** The query parser was originally planned as pure regex. During implementation, an LLM-based parser was added as the primary method (with regex fallback) because natural language queries like "I mostly wear baggy jeans — looking for a vintage tee" don't parse reliably with patterns. The fallback still exists if the Groq call fails or returns malformed JSON.
 
 ---
 
 ## AI Usage
 
 **Instance 1 — search_listings implementation:**
-Input to Claude: the Tool 1 spec block from `planning.md` (inputs, return value, failure mode) and the listings.json field list. Asked it to implement using `load_listings()` and score by keyword overlap across title, description, and style_tags with weighted scoring (title 3x, tags 2x, description 1x). Reviewed the generated code and adjusted the size matching from exact match to case-insensitive substring match (so "M" matches "S/M") after noticing the listings use composite sizes.
+Gave Claude the Tool 1 spec block from `planning.md` (inputs, return value, failure mode) and the listings.json field list. Asked it to implement using `load_listings()` with keyword scoring across title, description, and style_tags. Reviewed the generated code and changed size matching from exact string equality to case-insensitive substring matching after noticing that listings use composite sizes like "S/M" and "XL (oversized)". Also added per-field scoring weights (3×/2×/1×) which the generated version treated equally.
 
-**Instance 2 — planning loop implementation:**
-Input to Claude: the full Architecture ASCII diagram and the Planning Loop + State Management table from `planning.md`. Asked it to implement `run_agent()` following the exact conditional branches described. Reviewed the output and added an additional guard for empty `outfit_suggestion` (Step 5a) which the generated code omitted — the spec described it but the generated implementation skipped it.
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-Tests cover happy paths and all three failure modes:
-- `search_listings` with matching query, no-match query, price filter, size filter
-- `suggest_outfit` with populated wardrobe and empty wardrobe
-- `create_fit_card` with valid outfit, empty outfit string, whitespace-only outfit
+**Instance 2 — planning loop and retry logic:**
+Gave Claude the full Architecture ASCII diagram and the Planning Loop + State Management table from `planning.md`. Asked it to implement `run_agent()` with the exact conditional branches described. Reviewed the output and added `_search_with_retry()` as a separate function (the generated code inlined the retry which made it harder to test directly). Also added `session["retry_note"]` as a dedicated key — the generated version only communicated retry status through the error field.
 
 ---
 
@@ -178,11 +259,13 @@ fitfindr/
 ├── utils/
 │   └── data_loader.py         # load_listings(), get_example_wardrobe(), get_empty_wardrobe()
 ├── tests/
-│   └── test_tools.py          # pytest tests for all tools and failure modes
-├── planning.md                # Agent spec — filled out before implementation
-├── tools.py                   # search_listings, suggest_outfit, create_fit_card
-├── agent.py                   # run_agent() planning loop
-├── app.py                     # Gradio interface
+│   └── test_tools.py          # pytest tests — all tools + failure modes + retry
+├── planning.md                # Agent spec — filled before implementation
+├── tools.py                   # search_listings, suggest_outfit, create_fit_card, compare_price
+├── agent.py                   # run_agent() planning loop with retry logic
+├── app.py                     # Gradio interface — 5 output panels
+├── style_memory.py            # Style profile persistence (stretch)
+├── style_profile.json         # Auto-created when memory is enabled (gitignored)
 ├── requirements.txt
 └── .env                       # GROQ_API_KEY (not committed)
 ```

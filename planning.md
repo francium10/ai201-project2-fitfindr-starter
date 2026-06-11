@@ -216,3 +216,37 @@ Session: `fit_card` = above string.
 - Panel 1 (listing): "Graphic Tee — 2003 Tour Bootleg Style | $24.00 | depop | Size: L | Condition: good | Style: graphic tee, vintage, grunge, streetwear"
 - Panel 2 (outfit): The suggest_outfit string above
 - Panel 3 (fit card): The create_fit_card caption above
+
+---
+
+## Stretch Features
+
+### compare_price (Tool 4)
+
+**What it does:** Compares a listing's price against all other listings in the same category to assess whether it's a deal, fair, or overpriced.
+
+**Input parameters:**
+- `item` (dict): A listing dict with at least `price` (float) and `category` (str).
+
+**What it returns:** A string with a color-coded verdict (🟢🟡🟠🔴), the category price range, average, median, and a same-condition note.
+
+**What happens if it fails:** If fewer than 3 comparables exist, returns: "Not enough comparable listings to assess price." If item has no price, returns: "This item has no price listed."
+
+---
+
+### Style Profile Memory
+
+**Storage approach:** Preferences are saved to `style_profile.json` in the project root after each successful session. The profile stores: `preferred_styles` (list), `preferred_colors` (list), `size` (str|None), `max_price` (float|None), `past_searches` (list), `wardrobe_choice` (str).
+
+**How it flows:** On each query, `load_profile()` reads the file. If the user's query omits a size and the profile has one, the agent appends it. After a successful session, `update_profile_from_session()` extracts tags/colors/size from the selected item and saves back to disk.
+
+---
+
+### Retry Logic with Fallback
+
+**How it works:** `_search_with_retry()` in `agent.py` runs up to 3 attempts:
+1. Full constraints (description + size + max_price)
+2. Drop size filter if set
+3. Drop price filter if still empty
+
+Returns `(results, retry_note)` — the note describes exactly what was loosened. The agent displays it as a banner in the UI so the user knows what changed.
